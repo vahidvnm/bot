@@ -1,0 +1,41 @@
+@import "tailwindcss";
+
+@keyframes floatUpFade {
+  0% {
+    opacity: 1;
+    transform: translate(-50%, 0) scale(0.9);
+  }
+  40% {
+    opacity: 1;
+    transform: translate(-50%, -42px) scale(1.12);
+  }
+  100% {
+    opacity: 0;
+    transform: translate(-50%, -95px) scale(0.95);
+  }
+}
+
+.animate-float-up {
+  animation: floatUpFade 0.8s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  pointer-events: none;
+}
+
+/* Hide scrollbars cleanly on mobile tabs */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+body {
+  overscroll-behavior-y: none;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+}
+
+input,
+textarea {
+  user-select: text;
+}
