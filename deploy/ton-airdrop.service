@@ -1,0 +1,24 @@
+[Unit]
+Description=TON Airdrop Telegram bot + Mini App server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=airdrop
+Group=airdrop
+WorkingDirectory=/opt/ton-airdrop
+Environment=NODE_ENV=production
+# .env is loaded by the app itself (dotenv) from WorkingDirectory
+ExecStart=/usr/bin/node dist/server/index.js
+Restart=always
+RestartSec=5
+
+# Light hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

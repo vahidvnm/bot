@@ -189,17 +189,22 @@ The app only needs **one always-on Node process reachable over public HTTPS** �
    ⚠️ On the free plan the disk is wiped on redeploy — do not run a real token distribution on it; use a free VM instead.
 
 ### Deploy on a free VM (permanent, recommended)
+
+The repo ships a **one-shot bootstrap** (`deploy/setup.sh`) for a fresh Ubuntu 22.04/24.04 VM — it installs Node 22 + Caddy, hardens the firewall, clones this repo, builds it, and registers a systemd service with auto-HTTPS:
+
 ```bash
-# Oracle Cloud Always Free (Ubuntu 22/24, Ampere ARM) or any cheap VPS
-sudo apt update && sudo apt install -y git caddy
-curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt install -y nodejs
+# on the VM, after you have its public IP:
 git clone -b arena/ca6f6f6e-bot https://github.com/vahidvnm/bot.git && cd bot
-npm ci && cp .env.example .env   # edit: BOT_TOKEN, WEBAPP_URL, ADMIN_IDS
-npm run build
-sudo systemctl enable --now caddy   # Caddyfile: your-domain.com { reverse_proxy 127.0.0.1:3000 }
-node dist/server/index.js           # or wrap in a systemd/pm2 service
+sudo bash deploy/setup.sh <your-domain>     # e.g. bot.example.com  or  1.2.3.4.sslip.io
+nano /opt/ton-airdrop/.env                  # BOT_TOKEN, WEBAPP_URL=https://<domain>, ADMIN_IDS, ALLOW_DEMO_MODE=false
+sudo systemctl restart ton-airdrop
+# later updates:
+sudo bash /opt/ton-airdrop/deploy/update.sh
 ```
-Point a free domain/subdomain (e.g. DuckDNS or a Cloudflare-managed domain) at the VM, let Caddy handle HTTPS, and put that URL in `WEBAPP_URL`. SQLite stays on the VM's disk — set `DATABASE_PATH=/var/data/airdrop.db` if you prefer a dedicated volume.
+
+Files used: `deploy/setup.sh` (bootstrap), `deploy/Caddyfile` (auto-HTTPS reverse proxy), `deploy/ton-airdrop.service` (systemd unit), `deploy/update.sh` (pull + rebuild + restart).
+
+Point a free domain/subdomain (DuckDNS, or `<ip>.sslip.io` with zero signup) at the VM; open **TCP 22/80/443** in the cloud firewall. Caddy obtains the Let's Encrypt certificate automatically. SQLite stays on the VM's disk — set `DATABASE_PATH` if you prefer a dedicated volume.
 
 ### Docker (any host)
 ```bash
@@ -233,3 +238,43 @@ npm run dev
 - بدون `BOT_TOKEN` برنامه در حالت **Demo Sandbox** اجرا می‌شود و همه‌ی امکانات (کلیم روزانه، ماینینگ، تپ، boosts، رفرال، کیف پول TON، پنل ادمین) قابل تست هستند.
 - برای کوئست‌های «عضویت در کانال»، ربات را ادمین همان کانال کنید و در پنل ادمین نوع تأیید را `telegram_channel` با مقدار `@channel` بگذارید.
 - **سرور خودتان لازم نیست:** یا با «تونل رایگان» (cloudflared/ngrok) از کامپیوتر خودتان اجرا کنید، یا همین مخزن را روی **Render** (فایل `render.yaml` آماده است) یا یک **VM رایگان Oracle Always Free** بالا بیاورید. جدول مقایسه‌ی گزینه‌های رایگان در بخش «☁️ Free hosting options» آمده است. توجه: پلن رایگان Render دیسک دائمی ندارد و با هر ری‌دیپلوی دیتابیس صفر می‌شود؛ برای ایردراپ واقعی VM رایگان انتخاب بهتری است.
+
+---
+
+## ☁️ راه‌اندازی رایگان روی Oracle Cloud (گزینهی پیشنهادی برای ایردراپ واقعی)
+
+**بله — باید یک‌جا ثبت‌نام کنید:** در [oracle.com/cloud/free](https://www.oracle.com/cloud/free/) با ایمیل حساب بسازید. مراحل:
+
+1. **ثبت‌نام:** ایمیل، نام و آدرس (آدرس باید مطابق کارت باشد) → تأیید ایمیل.
+2. **احراز هویت با کارت:** ویزا/مسترکارت (دبیت هم قبول است) لازم است تا هویتتان تأیید شود. یک مبلغ کوچک موقتاً رزرو و بلافاصله برگردانده میشود؛ **شارژ نمیشود**. ⚠️ بدون کارت، ثبت‌نام ممکن نیست — در این حالت از تونل رایگان یا Render استفاده کنید.
+3. **طرح:** ۳۰ روز اعتبار ۳۰۰ دلاری میگیرید؛ بعد از ۳۰ روز حساب **خودکار به Always Free تبدیل میشود** و تا وقتی فقط از منابع رایگان استفاده کنید، پولی کم نمیشود.
+   منابع رایگان همیشگی: تا **۴ هستهی ARM + ۲۴ گیگ رم** (یا ۲ عدد VM کوچک AMD)، چند صد گیگ دیسک و ~۱۰ ترابایت ترافیک خروجی در ماه — برای این ربات بیش از کافی است.
+4. **ساخت ماشین (VM):** Console → Compute → Instances → Create →
+   - **منطقه (Region):** نزدیک به کاربرانتان (مثلاً Frankfurt یا Amsterdam)؛ منطقه را بعداً نمیتوان عوض کرد.
+   - **Shape:** `VM.Standard.A1.Flex` با ۱–۲ هسته و ۲–۴ گیگ رم (رایگان).
+   - **سیستمعامل:** Ubuntu 22.04 یا 24.04.
+   - **SSH Key:** یک کلید بسازید (یا فایل کلیدتان را بگذارید) تا با `ssh` وارد شوید.
+   - در **Security List / Inbound Rules** پورت‌های **22، 80 و 443** را باز کنید.
+5. **راه‌اندازی با یک دستور** (روی VM، بعد از ورود با SSH):
+   ```bash
+   sudo bash deploy/setup.sh <domain>
+   # مثال بدون خرید دامنه:  sudo bash deploy/setup.sh 1.2.3.4.sslip.io
+   ```
+   این اسکریپت همه‌چیز را نصب میکند: Node 22، Caddy با HTTPS خودکار، فایروال، بیلد پروژه، سرویس systemd و فایل `.env`.
+6. سپس:
+   ```bash
+   nano /opt/ton-airdrop/.env     # BOT_TOKEN، WEBAPP_URL=https://<domain>، ADMIN_IDS، ALLOW_DEMO_MODE=false
+   sudo systemctl restart ton-airdrop
+   ```
+   و در BotFather آدرس `https://<domain>` را به‌عنوان Mini App بدهید.
+
+**به‌روزرسانی بعدی:**
+```bash
+sudo bash /opt/ton-airdrop/deploy/update.sh
+```
+**لاگ‌ها:**
+```bash
+journalctl -u ton-airdrop -f
+```
+
+⚠️ دو نکته: (۱) پورت‌های امنیتی Oracle را در کنسول خودش هم باز کنید، وگرنه Caddy گواهی نمیگیرد. (۲) منابع Always Free برای استفادهی عادی کافی است، ولی اگر منابع زیادی آزاد کنید ممکن است اوراکل آنها را مصادره کند؛ همین ۱–۲ هسته ثابت بگذارید.
