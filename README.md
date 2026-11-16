@@ -167,6 +167,48 @@ Balances are spendable in-game (boost purchases) while `total_earned` tracks lif
 
 ---
 
+## ☁️ Free hosting options (no server of your own)
+
+The app only needs **one always-on Node process reachable over public HTTPS** — that is what Telegram Mini Apps and the bot's long polling require. It does **not** need a VPS you administer if one of these free tiers fits:
+
+| Option | Cost | Real HTTPS URL | Persistence | Verdict |
+| --- | --- | --- | --- | --- |
+| **Cloudflare Tunnel / ngrok + your PC** | Free | ✅ | ✅ (local SQLite file) | Fastest way to *test* inside Telegram; your computer must stay on. |
+| **GitHub Codespaces** | Free 60h/month (2-core) | ✅ (set port visibility → Public) | ✅ while the codespace lives | Great for a no-PC-required **test**, not for a running campaign. |
+| **Render (free web service, this repo ships `render.yaml`)** | Free | ✅ | ❌ ephemeral disk (resets on redeploy/sleep) | Works for a **demo/pilot**; keep it awake with a 5-min uptime ping and export the CSV often. |
+| **Koyeb / Hugging Face Spaces (Docker)** | Free tier | ✅ | ❌ ephemeral unless paid volume | Same trade-off as Render. |
+| **Oracle Cloud Always Free VM** (or GCP free `e2-micro`) | Free forever | ✅ (+ Caddy for TLS) | ✅ real disk | **Best free option for a real airdrop** — a permanent box, SQLite on disk, bot always online. Needs a card for identity verification. |
+| Vercel / Netlify | Free | ✅ | ❌ | ❌ Serverless: no long-running bot polling, no persistent SQLite. |
+| Cloudflare Workers + D1 | Free | ✅ | ✅ | ❌ Would need a rewrite of the DB layer + webhook mode. |
+
+### Deploy on Render in ~2 minutes (free)
+1. Push this repo to GitHub, then on [render.com](https://render.com) → **New → Blueprint** → select the repo (it picks up `render.yaml`).
+2. Wait for the Docker build → copy the `https://<name>.onrender.com` URL.
+3. In **Environment**, set `BOT_TOKEN`, `ADMIN_IDS`, and `WEBAPP_URL` (the onrender URL) → redeploy.
+4. Set the Mini App URL in BotFather (`/newapp`) and add an uptime pinger (UptimeRobot, 5 min) on `/api/health` so the free instance and the bot stay awake.
+   ⚠️ On the free plan the disk is wiped on redeploy — do not run a real token distribution on it; use a free VM instead.
+
+### Deploy on a free VM (permanent, recommended)
+```bash
+# Oracle Cloud Always Free (Ubuntu 22/24, Ampere ARM) or any cheap VPS
+sudo apt update && sudo apt install -y git caddy
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt install -y nodejs
+git clone -b arena/ca6f6f6e-bot https://github.com/vahidvnm/bot.git && cd bot
+npm ci && cp .env.example .env   # edit: BOT_TOKEN, WEBAPP_URL, ADMIN_IDS
+npm run build
+sudo systemctl enable --now caddy   # Caddyfile: your-domain.com { reverse_proxy 127.0.0.1:3000 }
+node dist/server/index.js           # or wrap in a systemd/pm2 service
+```
+Point a free domain/subdomain (e.g. DuckDNS or a Cloudflare-managed domain) at the VM, let Caddy handle HTTPS, and put that URL in `WEBAPP_URL`. SQLite stays on the VM's disk — set `DATABASE_PATH=/var/data/airdrop.db` if you prefer a dedicated volume.
+
+### Docker (any host)
+```bash
+docker build -t ton-airdrop .
+docker run -d -p 3000:3000 --env-file .env -v "$PWD/data:/app/data" ton-airdrop
+```
+
+---
+
 ## 🚢 Deployment checklist
 
 1. Node.js **22+** (for `node:sqlite`) behind a reverse proxy with HTTPS.
@@ -190,3 +232,4 @@ npm run dev
 - آیدی عددی تلگرام خودتان را در `ADMIN_IDS` بنویسید تا پنل ادمین باز شود.
 - بدون `BOT_TOKEN` برنامه در حالت **Demo Sandbox** اجرا می‌شود و همه‌ی امکانات (کلیم روزانه، ماینینگ، تپ، boosts، رفرال، کیف پول TON، پنل ادمین) قابل تست هستند.
 - برای کوئست‌های «عضویت در کانال»، ربات را ادمین همان کانال کنید و در پنل ادمین نوع تأیید را `telegram_channel` با مقدار `@channel` بگذارید.
+- **سرور خودتان لازم نیست:** یا با «تونل رایگان» (cloudflared/ngrok) از کامپیوتر خودتان اجرا کنید، یا همین مخزن را روی **Render** (فایل `render.yaml` آماده است) یا یک **VM رایگان Oracle Always Free** بالا بیاورید. جدول مقایسه‌ی گزینه‌های رایگان در بخش «☁️ Free hosting options» آمده است. توجه: پلن رایگان Render دیسک دائمی ندارد و با هر ری‌دیپلوی دیتابیس صفر می‌شود؛ برای ایردراپ واقعی VM رایگان انتخاب بهتری است.

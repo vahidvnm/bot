@@ -22,12 +22,17 @@ import {
 } from '../shared/types.js';
 import { parseTonAddress } from '../shared/ton.js';
 
-const DATA_DIR = path.resolve(process.cwd(), 'data');
+// DATABASE_PATH lets you point SQLite at a mounted persistent volume
+// (e.g. DATABASE_PATH=/var/data/airdrop.db on Railway / Fly / a VPS).
+const DB_PATH = process.env.DATABASE_PATH?.trim()
+  ? path.resolve(process.env.DATABASE_PATH.trim())
+  : path.resolve(process.cwd(), 'data', 'airdrop.db');
+
+const DATA_DIR = path.dirname(DB_PATH);
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
-const DB_PATH = path.join(DATA_DIR, 'airdrop.db');
 export const db = new DatabaseSync(DB_PATH);
 
 // Enable WAL mode & foreign keys for high concurrency between Bot and Web API

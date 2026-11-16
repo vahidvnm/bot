@@ -1,0 +1,32 @@
+# One-click deploy on Render (free plan) — https://render.com
+# Free tier notes: the service sleeps after ~15 min without traffic and the local
+# disk is EPHEMERAL (SQLite resets on redeploy/restart). Use an uptime pinger to
+# keep it awake, and export the CSV snapshot regularly — or deploy on a free VM
+# (Oracle Cloud Always Free) if you need real persistence.
+services:
+  - type: web
+    name: ton-airdrop-miniapp
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: frankfurt
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: 3000
+      - key: ALLOW_DEMO_MODE
+        value: "true"
+      - key: BOT_USERNAME
+        value: NovaDropBot
+      - key: ADMIN_SECRET
+        generateValue: true
+      # Fill these in the Render dashboard after the first deploy:
+      - key: BOT_TOKEN
+        sync: false
+      - key: WEBAPP_URL
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: DATABASE_PATH
+        value: /app/data/airdrop.db
