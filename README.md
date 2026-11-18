@@ -179,7 +179,23 @@ The app only needs **one always-on Node process reachable over public HTTPS** �
 | **Koyeb / Hugging Face Spaces (Docker)** | Free tier | ✅ | ❌ ephemeral unless paid volume | Same trade-off as Render. |
 | **Oracle Cloud Always Free VM** (or GCP free `e2-micro`) | Free forever | ✅ (+ Caddy for TLS) | ✅ real disk | **Best free option for a real airdrop** — a permanent box, SQLite on disk, bot always online. Needs a card for identity verification. |
 | Vercel / Netlify | Free | ✅ | ❌ | ❌ Serverless: no long-running bot polling, no persistent SQLite. |
-| Cloudflare Workers + D1 | Free | ✅ | ✅ | ❌ Would need a rewrite of the DB layer + webhook mode. |
+| **Cloudflare Workers + D1** (this repo ships `wrangler.toml`) | Free (100k req/day) | ✅ | ✅ D1 (5M reads/100k writes/day) | ✅ **Supported out of the box** — same codebase, Telegram webhook mode, `npm run deploy:worker`. Best no-VM option for a pilot. |
+
+### Deploy on Cloudflare Workers + D1 (free, no VM — recommended for pilots)
+
+The server code runs unmodified on Workers: one fetch-based app (`src/server/app.ts`) is served by both the Node entry and `src/server/worker.ts`, with **D1** as the database and **Static Assets** for the Mini App. Telegram runs in **webhook mode** (auto-configured on the first request — no polling, no always-on process).
+
+```bash
+npm install
+npx wrangler login                       # one-time, browser OAuth
+npx wrangler d1 create airdrop           # copy the printed database_id → wrangler.toml
+npx wrangler secret put BOT_TOKEN        # from @BotFather
+npx wrangler secret put ADMIN_SECRET     # strong random string for admin API
+# edit wrangler.toml [vars]: ALLOW_DEMO_MODE="false", ADMIN_IDS="your_id", WEBAPP_URL (optional)
+npm run deploy:worker                    # build + deploy → https://ton-airdrop-miniapp.<account>.workers.dev
+```
+
+Then register that URL as the Mini App in BotFather (`/newapp`). Free-tier limits: **100k requests/day**, D1 **5M reads + 100k writes/day**, 5GB storage — enough for a pilot of thousands of users. Broadcasts are batched (40 messages per request, `remaining` in the response). Local development with a local D1: `npm run dev:worker`.
 
 ### Deploy on Render in ~2 minutes (free)
 1. Push this repo to GitHub, then on [render.com](https://render.com) → **New → Blueprint** → select the repo (it picks up `render.yaml`).
@@ -238,6 +254,26 @@ npm run dev
 - بدون `BOT_TOKEN` برنامه در حالت **Demo Sandbox** اجرا می‌شود و همه‌ی امکانات (کلیم روزانه، ماینینگ، تپ، boosts، رفرال، کیف پول TON، پنل ادمین) قابل تست هستند.
 - برای کوئست‌های «عضویت در کانال»، ربات را ادمین همان کانال کنید و در پنل ادمین نوع تأیید را `telegram_channel` با مقدار `@channel` بگذارید.
 - **سرور خودتان لازم نیست:** یا با «تونل رایگان» (cloudflared/ngrok) از کامپیوتر خودتان اجرا کنید، یا همین مخزن را روی **Render** (فایل `render.yaml` آماده است) یا یک **VM رایگان Oracle Always Free** بالا بیاورید. جدول مقایسه‌ی گزینه‌های رایگان در بخش «☁️ Free hosting options» آمده است. توجه: پلن رایگان Render دیسک دائمی ندارد و با هر ری‌دیپلوی دیتابیس صفر می‌شود؛ برای ایردراپ واقعی VM رایگان انتخاب بهتری است.
+
+---
+
+## ☁️ دیپلوی رایگان روی Cloudflare Workers + D1 (بدون سرور)
+
+همین مخزن آمادهی دیپلوی روی Cloudflare است (فایل `wrangler.toml`) — محاسبات روی Workers، دیتابیس روی **D1** (SQLite رایگان) و فرانت‌اند با Static Assets. ربات با **Webhook** کار میکند (نه Long Polling) و webhook خودکار تنظیم میشود.
+
+```bash
+npm install
+npx wrangler login                    # یکبار، با مرورگر
+npx wrangler d1 create airdrop        # آیدی دیتابیس چاپ میشود → در wrangler.toml بگذارید
+npx wrangler secret put BOT_TOKEN     # توکن BotFather
+npx wrangler secret put ADMIN_SECRET  # یک رشتهی تصادفی قوی
+# در wrangler.toml بخش [vars]: ALLOW_DEMO_MODE="false" و ADMIN_IDS
+npm run deploy:worker                 # ← آدرس https://....workers.dev میگیرید
+```
+
+سپس همان آدرس را در BotFather به‌عنوان Mini App ثبت کنید (`/newapp`). محدودیت پلن رایگان: **۱۰۰ هزار درخواست در روز** و D1 با **۵ میلیون خواندن + ۱۰۰ هزار نوشتن در روز** — برای پایلوت با چند هزار کاربر کافی است. برادکست به‌صورت دستهای (۴۰ پیام در هر درخواست) ارسال میشود. تست لوکال: `npm run dev:worker`.
+
+⚠️ نکته: اگر `WEBAPP_URL` را خالی بگذارید، آدرس وب‌اپ خودکار از دامنهی Worker گرفته میشود. برای ایردراپ واقعیِ بلندمدت، VM رایگان (بخش بعدی) دیسک دائمیتری دارد.
 
 ---
 

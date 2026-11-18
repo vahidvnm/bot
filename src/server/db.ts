@@ -1,6 +1,3 @@
-import fs from 'node:fs';
-import path from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
 import {
   AppSettings,
   BOOST_CATALOG,
@@ -21,27 +18,15 @@ import {
   getTapPower,
 } from '../shared/types.js';
 import { parseTonAddress } from '../shared/ton.js';
+import { env } from './config.js';
+import { getExecutor, prepare } from './sql.js';
 
-// DATABASE_PATH lets you point SQLite at a mounted persistent volume
-// (e.g. DATABASE_PATH=/var/data/airdrop.db on Railway / Fly / a VPS).
-const DB_PATH = process.env.DATABASE_PATH?.trim()
-  ? path.resolve(process.env.DATABASE_PATH.trim())
-  : path.resolve(process.cwd(), 'data', 'airdrop.db');
-
-const DATA_DIR = path.dirname(DB_PATH);
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-}
-
-export const db = new DatabaseSync(DB_PATH);
-
-// Enable WAL mode & foreign keys for high concurrency between Bot and Web API
-db.exec(`
-  PRAGMA journal_mode = WAL;
-  PRAGMA synchronous = NORMAL;
-  PRAGMA foreign_keys = ON;
-
-  CREATE TABLE IF NOT EXISTS settings (
+/**
+ * SQLite schema — identical on node:sqlite (Node/VPS/Docker) and Cloudflare D1.
+ * PRAGMAs are applied only by the Node executor; D1 manages its own journal.
+ */
+export const SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
   );
@@ -110,7 +95,21 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_users_total_earned ON users(total_earned DESC);
   CREATE INDEX IF NOT EXISTS idx_users_referred_by ON users(referred_by);
   CREATE INDEX IF NOT EXISTS idx_tx_user ON transactions(telegram_id, id DESC);
-`);
+`;
+
+/** Idempotent — safe on every Workers cold start or once at Node boot. */
+export async function ensureSchema(): Promise<void> {
+  // Run DDL statement-by-statement: D1's exec() is unreliable with multi-line
+  // statements, while prepare().run() is the portable API on node:sqlite too.
+  const statements = SCHEMA_SQL.split(';')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  for (const statement of statements) {
+    await getExecutor().run(statement, []);
+  }
+  await seedDefaults();
+}
+
 
 function getUtcDateString(date = new Date()): string {
   return date.toISOString().slice(0, 10);
@@ -128,35 +127,35 @@ function getNextUtcMidnightIso(now = new Date()): string {
   return next.toISOString();
 }
 
-function seedDefaults(): void {
+async function seedDefaults(): Promise<void> {
   const defaultSettings: Record<string, string> = {
-    token_name: process.env.TOKEN_NAME || 'NovaTON',
-    token_symbol: process.env.TOKEN_SYMBOL || 'NOVA',
+    token_name: env('TOKEN_NAME') || 'NovaTON',
+    token_symbol: env('TOKEN_SYMBOL') || 'NOVA',
     referral_reward_regular: '2500',
     referral_reward_premium: '5000',
     referral_commission_pct: '10',
     airdrop_phase: 'Season 1 — Genesis Farming',
     snapshot_date: '2026-12-31',
-    bot_username: (process.env.BOT_USERNAME || 'NovaDropBot').replace(/^@/, ''),
+    bot_username: (env('BOT_USERNAME') || 'NovaDropBot').replace(/^@/, ''),
   };
 
-  const insertSetting = db.prepare(
+  const insertSetting = await prepare(
     `INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)`
   );
   for (const [k, v] of Object.entries(defaultSettings)) {
-    insertSetting.run(k, v);
+    await insertSetting.run(k, v);
   }
 
-  const taskCountRow = db.prepare(`SELECT COUNT(*) as cnt FROM tasks`).get() as {
+  const taskCountRow = await prepare(`SELECT COUNT(*) as cnt FROM tasks`).get() as {
     cnt: number;
   };
   if (taskCountRow.cnt === 0) {
-    const insertTask = db.prepare(`
+    const insertTask = await prepare(`
       INSERT INTO tasks (slug, title, description, category, reward, action_url, verification_type, target_value, is_active, sort_order)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
     `);
 
-    insertTask.run(
+    await insertTask.run(
       'join-tg-channel',
       'Join Official Telegram Channel',
       'Subscribe to our official announcement channel for snapshot & TGE updates.',
@@ -167,7 +166,7 @@ function seedDefaults(): void {
       '', // Set e.g. @YourChannel in Admin Panel to enforce live getChatMember check
       1
     );
-    insertTask.run(
+    await insertTask.run(
       'follow-x',
       'Follow Official X (Twitter)',
       'Follow our X account and stay tuned for daily bonus codes.',
@@ -178,7 +177,7 @@ function seedDefaults(): void {
       null,
       2
     );
-    insertTask.run(
+    await insertTask.run(
       'connect-ton-wallet',
       'Verify TON Wallet Eligibility',
       'Connect your Tonkeeper or Telegram Wallet to qualify for the TGE Jetton drop.',
@@ -189,7 +188,7 @@ function seedDefaults(): void {
       null,
       3
     );
-    insertTask.run(
+    await insertTask.run(
       'invite-1-friend',
       'Invite Your First Friend',
       'Share your personal invite link and onboard 1 friend.',
@@ -200,7 +199,7 @@ function seedDefaults(): void {
       '1',
       4
     );
-    insertTask.run(
+    await insertTask.run(
       'invite-5-friends',
       'Squad Builder (5 Invites)',
       'Invite 5 active friends to unlock the Squad Builder bonus.',
@@ -211,7 +210,7 @@ function seedDefaults(): void {
       '5',
       5
     );
-    insertTask.run(
+    await insertTask.run(
       'streak-7-days',
       '7-Day Streak Master',
       'Maintain a 7-day consecutive daily check-in streak.',
@@ -225,7 +224,7 @@ function seedDefaults(): void {
   }
 
   // Seed initial showcase pioneers if database is empty so Leaderboard looks great immediately
-  const userCountRow = db.prepare(`SELECT COUNT(*) as cnt FROM users`).get() as {
+  const userCountRow = await prepare(`SELECT COUNT(*) as cnt FROM users`).get() as {
     cnt: number;
   };
   if (userCountRow.cnt === 0) {
@@ -238,7 +237,7 @@ function seedDefaults(): void {
       { id: -104, username: 'satoshi_node', firstName: 'Liam K.', balance: 38400, earned: 44200, wallet: null },
       { id: -105, username: 'nova_hunter', firstName: 'Sofia', balance: 19750, earned: 23500, wallet: null },
     ];
-    const insertPioneer = db.prepare(`
+    const insertPioneer = await prepare(`
       INSERT INTO users (
         telegram_id, username, first_name, is_premium, balance, total_earned,
         wallet_address, wallet_provider, wallet_connected_at,
@@ -248,7 +247,7 @@ function seedDefaults(): void {
     for (const p of pioneers) {
       // Only store valid TON addresses or null
       const parsed = p.wallet ? parseTonAddress(p.wallet) : null;
-      insertPioneer.run(
+      await insertPioneer.run(
         p.id,
         p.username,
         p.firstName,
@@ -266,10 +265,9 @@ function seedDefaults(): void {
   }
 }
 
-seedDefaults();
 
-export function getSettings(): AppSettings {
-  const rows = db.prepare(`SELECT key, value FROM settings`).all() as Array<{
+export async function getSettings(): Promise<AppSettings> {
+  const rows = await prepare(`SELECT key, value FROM settings`).all() as Array<{
     key: string;
     value: string;
   }>;
@@ -284,15 +282,15 @@ export function getSettings(): AppSettings {
     referralCommissionPct: parseInt(map.referral_commission_pct || '10', 10),
     airdropPhase: map.airdrop_phase || 'Season 1 — Genesis Farming',
     snapshotDate: map.snapshot_date || '2026-12-31',
-    botUsername: (map.bot_username || process.env.BOT_USERNAME || 'NovaDropBot').replace(
+    botUsername: (map.bot_username || env('BOT_USERNAME') || 'NovaDropBot').replace(
       /^@/,
       ''
     ),
   };
 }
 
-export function updateSettings(partial: Partial<AppSettings>): AppSettings {
-  const upsert = db.prepare(`
+export async function updateSettings(partial: Partial<AppSettings>): Promise<AppSettings> {
+  const upsert = await prepare(`
     INSERT INTO settings (key, value) VALUES (?, ?)
     ON CONFLICT(key) DO UPDATE SET value = excluded.value
   `);
@@ -310,14 +308,14 @@ export function updateSettings(partial: Partial<AppSettings>): AppSettings {
 
   for (const [prop, dbKey] of mapping) {
     if (partial[prop] !== undefined) {
-      upsert.run(dbKey, String(partial[prop]).trim());
+      await upsert.run(dbKey, String(partial[prop]).trim());
     }
   }
-  return getSettings();
+  return await getSettings();
 }
 
 export function isAdminTelegramId(telegramId: number): boolean {
-  const raw = process.env.ADMIN_IDS || '';
+  const raw = env('ADMIN_IDS') || '';
   const ids = raw
     .split(',')
     .map((s) => parseInt(s.trim(), 10))
@@ -356,13 +354,13 @@ interface RawUserRow {
   last_active_at: string;
 }
 
-export function addTransaction(
+export async function addTransaction(
   telegramId: number,
   type: string,
   amount: number,
   description: string
-): void {
-  db.prepare(
+): Promise<void> {
+  await prepare(
     `INSERT INTO transactions (telegram_id, type, amount, description, created_at)
      VALUES (?, ?, ?, ?, ?)`
   ).run(telegramId, type, amount, description, new Date().toISOString());
@@ -383,16 +381,15 @@ export interface UpsertUserResult {
   referrerBonusAmount: number;
 }
 
-export function ensureUser(input: UpsertUserInput): UpsertUserResult {
-  const existing = db
-    .prepare(`SELECT * FROM users WHERE telegram_id = ?`)
+export async function ensureUser(input: UpsertUserInput): Promise<UpsertUserResult> {
+  const existing = await prepare(`SELECT * FROM users WHERE telegram_id = ?`)
     .get(input.telegramId) as RawUserRow | undefined;
 
   const nowMs = Date.now();
   const nowIso = new Date(nowMs).toISOString();
 
   if (existing) {
-    db.prepare(
+    await prepare(
       `UPDATE users
        SET username = COALESCE(?, username),
            first_name = ?,
@@ -411,13 +408,12 @@ export function ensureUser(input: UpsertUserInput): UpsertUserResult {
     return { isNewUser: false, referrerRewardedId: null, referrerBonusAmount: 0 };
   }
 
-  const settings = getSettings();
+  const settings = await getSettings();
   const welcomeBonus = input.isPremium ? 2000 : 1000;
 
   let validReferrerId: number | null = null;
   if (input.referrerId && input.referrerId !== input.telegramId && input.referrerId > 0) {
-    const refRow = db
-      .prepare(`SELECT telegram_id FROM users WHERE telegram_id = ?`)
+    const refRow = await prepare(`SELECT telegram_id FROM users WHERE telegram_id = ?`)
       .get(input.referrerId) as { telegram_id: number } | undefined;
     if (refRow) {
       validReferrerId = refRow.telegram_id;
@@ -428,7 +424,7 @@ export function ensureUser(input: UpsertUserInput): UpsertUserResult {
   const inviteeExtra = validReferrerId ? 1500 : 0;
   const startingBalance = welcomeBonus + inviteeExtra;
 
-  db.prepare(
+  await prepare(
     `INSERT INTO users (
       telegram_id, username, first_name, last_name, is_premium,
       balance, total_earned, energy, energy_updated_at, mining_started_at,
@@ -449,7 +445,7 @@ export function ensureUser(input: UpsertUserInput): UpsertUserResult {
     nowIso
   );
 
-  addTransaction(
+  await addTransaction(
     input.telegramId,
     'welcome',
     startingBalance,
@@ -464,7 +460,7 @@ export function ensureUser(input: UpsertUserInput): UpsertUserResult {
       ? settings.referralRewardPremium
       : settings.referralRewardRegular;
 
-    db.prepare(
+    await prepare(
       `UPDATE users
        SET balance = balance + ?,
            total_earned = total_earned + ?,
@@ -472,7 +468,7 @@ export function ensureUser(input: UpsertUserInput): UpsertUserResult {
        WHERE telegram_id = ?`
     ).run(referrerBonusAmount, referrerBonusAmount, referrerBonusAmount, validReferrerId);
 
-    addTransaction(
+    await addTransaction(
       validReferrerId,
       'referral_bonus',
       referrerBonusAmount,
@@ -541,20 +537,19 @@ function computeDailyStatus(row: RawUserRow, now = new Date()): {
   };
 }
 
-export function buildUserState(
+export async function buildUserState(
   telegramId: number,
   authMode: 'telegram' | 'demo' = 'telegram',
   forceAdmin = false
-): UserStateResponse {
-  const row = db
-    .prepare(`SELECT * FROM users WHERE telegram_id = ?`)
+): Promise<UserStateResponse> {
+  const row = await prepare(`SELECT * FROM users WHERE telegram_id = ?`)
     .get(telegramId) as RawUserRow | undefined;
 
   if (!row) {
     throw new Error('User not found');
   }
 
-  const settings = getSettings();
+  const settings = await getSettings();
   const now = new Date();
   const nowMs = now.getTime();
   const today = getUtcDateString(now);
@@ -567,12 +562,10 @@ export function buildUserState(
 
   const refillsUsed = row.last_refill_date === today ? row.daily_refills_used : 0;
 
-  const referralsCountRow = db
-    .prepare(`SELECT COUNT(*) as cnt FROM users WHERE referred_by = ?`)
+  const referralsCountRow = await prepare(`SELECT COUNT(*) as cnt FROM users WHERE referred_by = ?`)
     .get(telegramId) as { cnt: number };
 
-  const rankRow = db
-    .prepare(
+  const rankRow = await prepare(
       `SELECT COUNT(*) + 1 as rank FROM users WHERE total_earned > ? AND is_banned = 0`
     )
     .get(row.total_earned) as { rank: number };
@@ -628,18 +621,18 @@ export function buildUserState(
   };
 }
 
-function distributeReferralCommission(
+async function distributeReferralCommission(
   earnerId: number,
   referredBy: number | null,
   baseEarned: number,
   sourceLabel: string
-): void {
+): Promise<void> {
   if (!referredBy || baseEarned <= 0) return;
-  const settings = getSettings();
+  const settings = await getSettings();
   const commission = Math.floor((baseEarned * settings.referralCommissionPct) / 100);
   if (commission <= 0) return;
 
-  db.prepare(
+  await prepare(
     `UPDATE users
      SET balance = balance + ?,
          total_earned = total_earned + ?,
@@ -647,7 +640,7 @@ function distributeReferralCommission(
      WHERE telegram_id = ?`
   ).run(commission, commission, commission, referredBy);
 
-  addTransaction(
+  await addTransaction(
     referredBy,
     'referral_commission',
     commission,
@@ -655,13 +648,12 @@ function distributeReferralCommission(
   );
 }
 
-export function claimDailyReward(telegramId: number): {
+export async function claimDailyReward(telegramId: number): Promise<{
   reward: number;
   newStreak: number;
   nextResetIso: string;
-} {
-  const row = db
-    .prepare(`SELECT * FROM users WHERE telegram_id = ?`)
+}>  {
+  const row = await prepare(`SELECT * FROM users WHERE telegram_id = ?`)
     .get(telegramId) as RawUserRow | undefined;
   if (!row) throw new Error('User not found');
   if (row.is_banned) throw new Error('Account is restricted');
@@ -677,7 +669,7 @@ export function claimDailyReward(telegramId: number): {
   const newStreak = daily.effectiveStreak + 1;
   const reward = daily.nextReward;
 
-  db.prepare(
+  await prepare(
     `UPDATE users
      SET balance = balance + ?,
          total_earned = total_earned + ?,
@@ -687,14 +679,14 @@ export function claimDailyReward(telegramId: number): {
      WHERE telegram_id = ?`
   ).run(reward, reward, newStreak, today, now.toISOString(), telegramId);
 
-  addTransaction(
+  await addTransaction(
     telegramId,
     'daily_claim',
     reward,
     `Day ${daily.nextStreakDay} streak reward (Total streak: ${newStreak}d)`
   );
 
-  distributeReferralCommission(telegramId, row.referred_by, reward, 'Daily Claim');
+  await distributeReferralCommission(telegramId, row.referred_by, reward, 'Daily Claim');
 
   return {
     reward,
@@ -703,11 +695,10 @@ export function claimDailyReward(telegramId: number): {
   };
 }
 
-export function claimMiningStorage(telegramId: number): {
+export async function claimMiningStorage(telegramId: number): Promise<{
   claimed: number;
-} {
-  const row = db
-    .prepare(`SELECT * FROM users WHERE telegram_id = ?`)
+}>  {
+  const row = await prepare(`SELECT * FROM users WHERE telegram_id = ?`)
     .get(telegramId) as RawUserRow | undefined;
   if (!row) throw new Error('User not found');
   if (row.is_banned) throw new Error('Account is restricted');
@@ -718,7 +709,7 @@ export function claimMiningStorage(telegramId: number): {
     throw new Error('Mining vault has less than 1 token accumulated yet. Give it a minute!');
   }
 
-  db.prepare(
+  await prepare(
     `UPDATE users
      SET balance = balance + ?,
          total_earned = total_earned + ?,
@@ -727,28 +718,27 @@ export function claimMiningStorage(telegramId: number): {
      WHERE telegram_id = ?`
   ).run(mining.pending, mining.pending, nowMs, new Date(nowMs).toISOString(), telegramId);
 
-  addTransaction(
+  await addTransaction(
     telegramId,
     'mining_claim',
     mining.pending,
     `Harvested passive mining vault (+${mining.pending})`
   );
 
-  distributeReferralCommission(telegramId, row.referred_by, mining.pending, 'Mining Harvest');
+  await distributeReferralCommission(telegramId, row.referred_by, mining.pending, 'Mining Harvest');
 
   return { claimed: mining.pending };
 }
 
-export function processTaps(
+export async function processTaps(
   telegramId: number,
   requestedTaps: number
-): {
+): Promise<{
   acceptedTaps: number;
   earned: number;
   remainingEnergy: number;
-} {
-  const row = db
-    .prepare(`SELECT * FROM users WHERE telegram_id = ?`)
+}>  {
+  const row = await prepare(`SELECT * FROM users WHERE telegram_id = ?`)
     .get(telegramId) as RawUserRow | undefined;
   if (!row) throw new Error('User not found');
   if (row.is_banned) throw new Error('Account is restricted');
@@ -767,7 +757,7 @@ export function processTaps(
   const earned = acceptedTaps * tapPower;
   const remainingEnergy = Math.max(0, currentEnergy - earned);
 
-  db.prepare(
+  await prepare(
     `UPDATE users
      SET balance = balance + ?,
          total_earned = total_earned + ?,
@@ -780,9 +770,8 @@ export function processTaps(
   return { acceptedTaps, earned, remainingEnergy };
 }
 
-export function refillEnergy(telegramId: number): { energy: number; refillsLeft: number } {
-  const row = db
-    .prepare(`SELECT * FROM users WHERE telegram_id = ?`)
+export async function refillEnergy(telegramId: number): Promise<{ energy: number; refillsLeft: number }>  {
+  const row = await prepare(`SELECT * FROM users WHERE telegram_id = ?`)
     .get(telegramId) as RawUserRow | undefined;
   if (!row) throw new Error('User not found');
 
@@ -798,7 +787,7 @@ export function refillEnergy(telegramId: number): { energy: number; refillsLeft:
   const maxEnergy = getMaxEnergy(row.level_energy_limit);
   const newUsed = usedToday + 1;
 
-  db.prepare(
+  await prepare(
     `UPDATE users
      SET energy = ?,
          energy_updated_at = ?,
@@ -814,15 +803,14 @@ export function refillEnergy(telegramId: number): { energy: number; refillsLeft:
   };
 }
 
-export function upgradeBoost(
+export async function upgradeBoost(
   telegramId: number,
   boostType: BoostType
-): { newLevel: number; cost: number } {
+): Promise<{ newLevel: number; cost: number }>  {
   const def = BOOST_CATALOG[boostType];
   if (!def) throw new Error('Invalid boost type');
 
-  const row = db
-    .prepare(`SELECT * FROM users WHERE telegram_id = ?`)
+  const row = await prepare(`SELECT * FROM users WHERE telegram_id = ?`)
     .get(telegramId) as RawUserRow | undefined;
   if (!row) throw new Error('User not found');
 
@@ -851,7 +839,7 @@ export function upgradeBoost(
   if (boostType === 'mining_rig') {
     const pending = computeMiningPending(row, nowMs).pending;
     if (pending > 0) {
-      db.prepare(
+      await prepare(
         `UPDATE users
          SET balance = balance + ? - ?,
              total_earned = total_earned + ?,
@@ -860,14 +848,14 @@ export function upgradeBoost(
              last_active_at = ?
          WHERE telegram_id = ?`
       ).run(pending, cost, pending, nowMs, newLevel, nowIso, telegramId);
-      addTransaction(
+      await addTransaction(
         telegramId,
         'mining_claim',
         pending,
         `Auto-harvested vault before ${def.title} upgrade`
       );
     } else {
-      db.prepare(
+      await prepare(
         `UPDATE users
          SET balance = balance - ?,
              level_mining_rig = ?,
@@ -877,7 +865,7 @@ export function upgradeBoost(
     }
   } else if (boostType === 'energy_limit') {
     const newMax = getMaxEnergy(newLevel);
-    db.prepare(
+    await prepare(
       `UPDATE users
        SET balance = balance - ?,
            level_energy_limit = ?,
@@ -887,7 +875,7 @@ export function upgradeBoost(
        WHERE telegram_id = ?`
     ).run(cost, newLevel, newMax, nowMs, nowIso, telegramId);
   } else if (boostType === 'multitap') {
-    db.prepare(
+    await prepare(
       `UPDATE users
        SET balance = balance - ?,
            level_multitap = ?,
@@ -895,7 +883,7 @@ export function upgradeBoost(
        WHERE telegram_id = ?`
     ).run(cost, newLevel, nowIso, telegramId);
   } else {
-    db.prepare(
+    await prepare(
       `UPDATE users
        SET balance = balance - ?,
            level_storage_tank = ?,
@@ -904,7 +892,7 @@ export function upgradeBoost(
     ).run(cost, newLevel, nowIso, telegramId);
   }
 
-  addTransaction(
+  await addTransaction(
     telegramId,
     'boost_upgrade',
     -cost,
@@ -914,15 +902,15 @@ export function upgradeBoost(
   return { newLevel, cost };
 }
 
-export function connectUserWallet(
+export async function connectUserWallet(
   telegramId: number,
   addressInput: string,
   providerName = 'TON Connect'
-): {
+): Promise<{
   friendlyAddress: string;
   rawAddress: string;
   bonusAwarded: number;
-} {
+}>  {
   const parsed = parseTonAddress(addressInput);
   if (!parsed) {
     throw new Error(
@@ -930,14 +918,12 @@ export function connectUserWallet(
     );
   }
 
-  const row = db
-    .prepare(`SELECT * FROM users WHERE telegram_id = ?`)
+  const row = await prepare(`SELECT * FROM users WHERE telegram_id = ?`)
     .get(telegramId) as RawUserRow | undefined;
   if (!row) throw new Error('User not found');
 
   // Prevent linking exact same wallet to multiple accounts (anti-sybil protection!)
-  const duplicate = db
-    .prepare(
+  const duplicate = await prepare(
       `SELECT telegram_id FROM users WHERE wallet_raw_address = ? AND telegram_id != ?`
     )
     .get(parsed.raw, telegramId) as { telegram_id: number } | undefined;
@@ -949,7 +935,7 @@ export function connectUserWallet(
   const isFirstBonus = row.wallet_bonus_claimed === 0;
   const bonus = isFirstBonus ? WALLET_CONNECT_BONUS : 0;
 
-  db.prepare(
+  await prepare(
     `UPDATE users
      SET wallet_address = ?,
          wallet_raw_address = ?,
@@ -972,7 +958,7 @@ export function connectUserWallet(
   );
 
   if (bonus > 0) {
-    addTransaction(
+    await addTransaction(
       telegramId,
       'wallet_bonus',
       bonus,
@@ -987,8 +973,8 @@ export function connectUserWallet(
   };
 }
 
-export function disconnectUserWallet(telegramId: number): void {
-  db.prepare(
+export async function disconnectUserWallet(telegramId: number): Promise<void> {
+  await prepare(
     `UPDATE users
      SET wallet_address = NULL,
          wallet_raw_address = NULL,
@@ -998,9 +984,8 @@ export function disconnectUserWallet(telegramId: number): void {
   ).run(telegramId);
 }
 
-export function getUserTasks(telegramId: number): TaskItem[] {
-  const rows = db
-    .prepare(
+export async function getUserTasks(telegramId: number): Promise<TaskItem[]> {
+  const rows = await prepare(
       `SELECT t.*, ut.completed_at
        FROM tasks t
        LEFT JOIN user_tasks ut ON ut.task_id = t.id AND ut.telegram_id = ?
@@ -1037,8 +1022,8 @@ export function getUserTasks(telegramId: number): TaskItem[] {
   }));
 }
 
-export function getTaskById(taskId: number): TaskItem | null {
-  const r = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(taskId) as
+export async function getTaskById(taskId: number): Promise<TaskItem | null> {
+  const r = await prepare(`SELECT * FROM tasks WHERE id = ?`).get(taskId) as
     | {
         id: number;
         slug: string;
@@ -1067,24 +1052,22 @@ export function getTaskById(taskId: number): TaskItem | null {
   };
 }
 
-export function completeTaskForUser(
+export async function completeTaskForUser(
   telegramId: number,
   taskId: number
-): { reward: number; taskTitle: string } {
-  const task = getTaskById(taskId);
+): Promise<{ reward: number; taskTitle: string }>  {
+  const task = await getTaskById(taskId);
   if (!task || !task.isActive) {
     throw new Error('Task not found or inactive.');
   }
 
-  const already = db
-    .prepare(`SELECT completed_at FROM user_tasks WHERE telegram_id = ? AND task_id = ?`)
+  const already = await prepare(`SELECT completed_at FROM user_tasks WHERE telegram_id = ? AND task_id = ?`)
     .get(telegramId, taskId);
   if (already) {
     throw new Error('You have already claimed this task reward.');
   }
 
-  const user = db
-    .prepare(`SELECT * FROM users WHERE telegram_id = ?`)
+  const user = await prepare(`SELECT * FROM users WHERE telegram_id = ?`)
     .get(telegramId) as RawUserRow | undefined;
   if (!user) throw new Error('User not found');
 
@@ -1095,8 +1078,7 @@ export function completeTaskForUser(
     }
   } else if (task.verificationType === 'invite_count') {
     const required = parseInt(task.targetValue || '1', 10);
-    const invRow = db
-      .prepare(`SELECT COUNT(*) as cnt FROM users WHERE referred_by = ?`)
+    const invRow = await prepare(`SELECT COUNT(*) as cnt FROM users WHERE referred_by = ?`)
       .get(telegramId) as { cnt: number };
     if (invRow.cnt < required) {
       throw new Error(
@@ -1113,11 +1095,11 @@ export function completeTaskForUser(
   }
 
   const nowIso = new Date().toISOString();
-  db.prepare(
+  await prepare(
     `INSERT INTO user_tasks (telegram_id, task_id, completed_at) VALUES (?, ?, ?)`
   ).run(telegramId, taskId, nowIso);
 
-  db.prepare(
+  await prepare(
     `UPDATE users
      SET balance = balance + ?,
          total_earned = total_earned + ?,
@@ -1125,14 +1107,13 @@ export function completeTaskForUser(
      WHERE telegram_id = ?`
   ).run(task.reward, task.reward, nowIso, telegramId);
 
-  addTransaction(telegramId, 'task_reward', task.reward, `Task completed: ${task.title}`);
+  await addTransaction(telegramId, 'task_reward', task.reward, `Task completed: ${task.title}`);
 
   return { reward: task.reward, taskTitle: task.title };
 }
 
-export function getUserReferrals(telegramId: number): ReferralFriend[] {
-  const rows = db
-    .prepare(
+export async function getUserReferrals(telegramId: number): Promise<ReferralFriend[]> {
+  const rows = await prepare(
       `SELECT telegram_id, username, first_name, total_earned, created_at, is_premium
        FROM users
        WHERE referred_by = ?
@@ -1158,9 +1139,8 @@ export function getUserReferrals(telegramId: number): ReferralFriend[] {
   }));
 }
 
-export function getLeaderboard(limit = 50): LeaderboardEntry[] {
-  const rows = db
-    .prepare(
+export async function getLeaderboard(limit = 50): Promise<LeaderboardEntry[]> {
+  const rows = await prepare(
       `SELECT telegram_id, username, first_name, balance, total_earned, wallet_address
        FROM users
        WHERE is_banned = 0
@@ -1187,9 +1167,8 @@ export function getLeaderboard(limit = 50): LeaderboardEntry[] {
   }));
 }
 
-export function getUserTransactions(telegramId: number, limit = 25): TransactionRecord[] {
-  const rows = db
-    .prepare(
+export async function getUserTransactions(telegramId: number, limit = 25): Promise<TransactionRecord[]> {
+  const rows = await prepare(
       `SELECT id, type, amount, description, created_at
        FROM transactions
        WHERE telegram_id = ?
@@ -1215,11 +1194,10 @@ export function getUserTransactions(telegramId: number, limit = 25): Transaction
 
 // ================= ADMIN OPERATIONS =================
 
-export function getAdminStats() {
+export async function getAdminStats() {
   const today = getUtcDateString();
 
-  const totals = db
-    .prepare(
+  const totals = await prepare(
       `SELECT
          COUNT(*) as totalUsers,
          SUM(CASE WHEN telegram_id > 0 THEN 1 ELSE 0 END) as realUsers,
@@ -1239,8 +1217,7 @@ export function getAdminStats() {
     claimedToday: number;
   };
 
-  const tasksCompleted = db
-    .prepare(`SELECT COUNT(*) as cnt FROM user_tasks`)
+  const tasksCompleted = await prepare(`SELECT COUNT(*) as cnt FROM user_tasks`)
     .get() as { cnt: number };
 
   return {
@@ -1252,9 +1229,8 @@ export function getAdminStats() {
   };
 }
 
-export function getAdminAllTasks(): TaskItem[] {
-  const rows = db
-    .prepare(`SELECT * FROM tasks ORDER BY sort_order ASC, id ASC`)
+export async function getAdminAllTasks(): Promise<TaskItem[]> {
+  const rows = await prepare(`SELECT * FROM tasks ORDER BY sort_order ASC, id ASC`)
     .all() as Array<{
     id: number;
     slug: string;
@@ -1282,7 +1258,7 @@ export function getAdminAllTasks(): TaskItem[] {
   }));
 }
 
-export function createAdminTask(input: {
+export async function createAdminTask(input: {
   title: string;
   description: string;
   category: 'social' | 'onchain' | 'milestone';
@@ -1290,7 +1266,7 @@ export function createAdminTask(input: {
   actionUrl?: string | null;
   verificationType: TaskItem['verificationType'];
   targetValue?: string | null;
-}): TaskItem {
+}): Promise<TaskItem> {
   const slug =
     input.title
       .toLowerCase()
@@ -1299,8 +1275,7 @@ export function createAdminTask(input: {
     '-' +
     Date.now().toString(36);
 
-  const info = db
-    .prepare(
+  const info = await prepare(
       `INSERT INTO tasks (slug, title, description, category, reward, action_url, verification_type, target_value, is_active, sort_order)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 99)`
     )
@@ -1315,22 +1290,23 @@ export function createAdminTask(input: {
       input.targetValue?.trim() || null
     );
 
-  return getTaskById(Number(info.lastInsertRowid))!;
+  const created = await getTaskById(Number(info.lastInsertRowid));
+  if (!created) throw new Error('Failed to create task');
+  return created;
 }
 
-export function toggleAdminTask(taskId: number, isActive: boolean): void {
-  db.prepare(`UPDATE tasks SET is_active = ? WHERE id = ?`).run(isActive ? 1 : 0, taskId);
+export async function toggleAdminTask(taskId: number, isActive: boolean): Promise<void> {
+  await prepare(`UPDATE tasks SET is_active = ? WHERE id = ?`).run(isActive ? 1 : 0, taskId);
 }
 
-export function deleteAdminTask(taskId: number): void {
-  db.prepare(`DELETE FROM user_tasks WHERE task_id = ?`).run(taskId);
-  db.prepare(`DELETE FROM tasks WHERE id = ?`).run(taskId);
+export async function deleteAdminTask(taskId: number): Promise<void> {
+  await prepare(`DELETE FROM user_tasks WHERE task_id = ?`).run(taskId);
+  await prepare(`DELETE FROM tasks WHERE id = ?`).run(taskId);
 }
 
-export function listAdminUsers(search = '', limit = 50) {
+export async function listAdminUsers(search = '', limit = 50) {
   const q = `%${search.trim()}%`;
-  return db
-    .prepare(
+  return await prepare(
       `SELECT telegram_id, username, first_name, balance, total_earned, wallet_address, daily_streak, is_banned, created_at
        FROM users
        WHERE (? = '%%' OR username LIKE ? OR first_name LIKE ? OR CAST(telegram_id AS TEXT) LIKE ? OR wallet_address LIKE ?)
@@ -1340,30 +1316,29 @@ export function listAdminUsers(search = '', limit = 50) {
     .all(q, q, q, q, q, limit);
 }
 
-export function adjustUserBalance(
+export async function adjustUserBalance(
   telegramId: number,
   delta: number,
   reason = 'Admin adjustment'
-): void {
-  db.prepare(
+): Promise<void> {
+  await prepare(
     `UPDATE users
      SET balance = MAX(0, balance + ?),
          total_earned = CASE WHEN ? > 0 THEN total_earned + ? ELSE total_earned END
      WHERE telegram_id = ?`
   ).run(delta, delta, delta, telegramId);
-  addTransaction(telegramId, 'admin_adjust', delta, reason);
+  await addTransaction(telegramId, 'admin_adjust', delta, reason);
 }
 
-export function setUserBanStatus(telegramId: number, banned: boolean): void {
-  db.prepare(`UPDATE users SET is_banned = ? WHERE telegram_id = ?`).run(
+export async function setUserBanStatus(telegramId: number, banned: boolean): Promise<void> {
+  await prepare(`UPDATE users SET is_banned = ? WHERE telegram_id = ?`).run(
     banned ? 1 : 0,
     telegramId
   );
 }
 
-export function exportAirdropSnapshotCsv(): string {
-  const rows = db
-    .prepare(
+export async function exportAirdropSnapshotCsv(): Promise<string> {
+  const rows = await prepare(
       `SELECT
          u.telegram_id,
          u.username,
@@ -1429,9 +1404,8 @@ export function exportAirdropSnapshotCsv(): string {
   return [header, ...lines].join('\n');
 }
 
-export function getAllRealTelegramUserIds(): number[] {
-  const rows = db
-    .prepare(`SELECT telegram_id FROM users WHERE telegram_id > 0 AND is_banned = 0`)
+export async function getAllRealTelegramUserIds(): Promise<number[]> {
+  const rows = await prepare(`SELECT telegram_id FROM users WHERE telegram_id > 0 AND is_banned = 0`)
     .all() as Array<{ telegram_id: number }>;
   return rows.map((r) => r.telegram_id);
 }

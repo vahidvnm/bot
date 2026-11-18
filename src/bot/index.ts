@@ -1,4 +1,5 @@
 import { Bot, InlineKeyboard, InputFile } from 'grammy';
+import type { Update } from 'grammy/types';
 import {
   buildUserState,
   claimDailyReward,
@@ -13,30 +14,41 @@ import {
   isAdminTelegramId,
   updateSettings,
 } from '../server/db.js';
+import { env } from '../server/config.js';
 import { getUserLeague, WALLET_CONNECT_BONUS } from '../shared/types.js';
 import { parseTonAddress, shortenAddress } from '../shared/ton.js';
 
 let botInstance: Bot | null = null;
 let botRunning = false;
+let pollingActive = false;
+let workerOrigin: string | null = null;
 let botUsernameDetected: string | null = null;
 
 // Track users waiting to paste a TON address or admin broadcast in chat
 const awaitingWalletUsers = new Set<number>();
 
-export function getBotStatus() {
+export async function getBotStatus() {
+  const configured = Boolean(env('BOT_TOKEN'));
   return {
-    configured: Boolean(process.env.BOT_TOKEN),
+    configured,
     running: botRunning,
-    username: botUsernameDetected || getSettings().botUsername,
+    mode: !configured ? 'off' : pollingActive ? 'polling' : botRunning ? 'webhook' : 'starting',
+    username: botUsernameDetected || (await getSettings()).botUsername,
     webAppUrl: getWebAppUrl(),
   };
 }
 
+/** Workers entry calls this so menu buttons / referral links work without WEBAPP_URL. */
+export function setWorkerOrigin(origin: string): void {
+  if (origin.startsWith('https://')) workerOrigin = origin.replace(/\/$/, '');
+}
+
 export function getWebAppUrl(): string | null {
-  const raw = (process.env.WEBAPP_URL || '').trim();
+  const raw = (env('WEBAPP_URL') || '').trim();
   if (raw && raw.startsWith('https://')) {
     return raw.replace(/\/$/, '');
   }
+  if (workerOrigin) return workerOrigin;
   return null;
 }
 
@@ -67,16 +79,20 @@ export async function verifyTelegramChannelMembership(
 }
 
 export async function broadcastMessageToUsers(
-  messageText: string
-): Promise<{ sent: number; failed: number }> {
+  messageText: string,
+  options: { max?: number } = {}
+): Promise<{ sent: number; failed: number; remaining: number }> {
   if (!botInstance) {
     throw new Error('Telegram BOT_TOKEN is not active.');
   }
-  const userIds = getAllRealTelegramUserIds();
+  const userIds = await getAllRealTelegramUserIds();
+  // Cloudflare Workers free plan allows ~50 subrequests per invocation — batch by default.
+  const max = options.max ?? userIds.length;
+  const batch = userIds.slice(0, Number.isFinite(max) ? max : userIds.length);
   let sent = 0;
   let failed = 0;
 
-  for (const uid of userIds) {
+  for (const uid of batch) {
     try {
       await botInstance.api.sendMessage(uid, messageText, { parse_mode: 'HTML' });
       sent++;
@@ -86,7 +102,7 @@ export async function broadcastMessageToUsers(
       failed++;
     }
   }
-  return { sent, failed };
+  return { sent, failed, remaining: Math.max(0, userIds.length - batch.length) };
 }
 
 function buildMainMenuKeyboard(): InlineKeyboard {
@@ -109,8 +125,8 @@ function buildMainMenuKeyboard(): InlineKeyboard {
   return kb;
 }
 
-function formatDashboardText(telegramId: number): string {
-  const state = buildUserState(telegramId, 'telegram');
+async function formatDashboardText(telegramId: number): Promise<string> {
+  const state = await buildUserState(telegramId, 'telegram');
   const { user, settings } = state;
   const league = getUserLeague(user.totalEarned);
 
@@ -145,13 +161,21 @@ function escapeHtml(str: string): string {
     .replace(/>/g, '&gt;');
 }
 
-export async function startTelegramBot(): Promise<void> {
-  const token = (process.env.BOT_TOKEN || '').trim();
+let initPromise: Promise<Bot | null> | null = null;
+
+/** Create + configure the bot once (commands & handlers). Shared by polling (Node) and webhook (Workers). */
+export function ensureBot(): Promise<Bot | null> {
+  if (!initPromise) initPromise = initBot();
+  return initPromise;
+}
+
+async function initBot(): Promise<Bot | null> {
+  const token = (env('BOT_TOKEN') || '').trim();
   if (!token) {
     console.log(
       '[Bot] BOT_TOKEN is not set in .env — running Web Mini App & API in standalone/preview mode.'
     );
-    return;
+    return null;
   }
 
   try {
@@ -160,7 +184,7 @@ export async function startTelegramBot(): Promise<void> {
 
     const me = await bot.api.getMe();
     botUsernameDetected = me.username;
-    updateSettings({ botUsername: me.username });
+    await updateSettings({ botUsername: me.username });
 
     await bot.api.setMyCommands([
       { command: 'start', description: '🚀 Launch Airdrop & Dashboard' },
@@ -178,7 +202,7 @@ export async function startTelegramBot(): Promise<void> {
         await bot.api.setChatMenuButton({
           menu_button: {
             type: 'web_app',
-            text: `🚀 Play $${getSettings().tokenSymbol}`,
+            text: `🚀 Play $${(await getSettings()).tokenSymbol}`,
             web_app: { url: webAppUrl },
           },
         });
@@ -200,7 +224,7 @@ export async function startTelegramBot(): Promise<void> {
         referrerId = parseInt(payload, 10);
       }
 
-      const result = ensureUser({
+      const result = await ensureUser({
         telegramId: ctx.from.id,
         username: ctx.from.username || null,
         firstName: ctx.from.first_name || 'Explorer',
@@ -209,7 +233,7 @@ export async function startTelegramBot(): Promise<void> {
         referrerId,
       });
 
-      const settings = getSettings();
+      const settings = await getSettings();
 
       if (result.isNewUser && result.referrerRewardedId) {
         try {
@@ -227,7 +251,7 @@ export async function startTelegramBot(): Promise<void> {
         }
       }
 
-      await ctx.reply(formatDashboardText(ctx.from.id), {
+      await ctx.reply(await formatDashboardText(ctx.from.id), {
         parse_mode: 'HTML',
         reply_markup: buildMainMenuKeyboard(),
       });
@@ -235,15 +259,15 @@ export async function startTelegramBot(): Promise<void> {
 
     bot.command('claim', async (ctx) => {
       if (!ctx.from) return;
-      ensureUser({
+      await ensureUser({
         telegramId: ctx.from.id,
         username: ctx.from.username || null,
         firstName: ctx.from.first_name,
         isPremium: Boolean(ctx.from.is_premium),
       });
-      const settings = getSettings();
+      const settings = await getSettings();
       try {
-        const res = claimDailyReward(ctx.from.id);
+        const res = await claimDailyReward(ctx.from.id);
         await ctx.reply(
           `🎁 <b>Daily Reward Claimed!</b>\n\n` +
             `➕ <b>+${res.reward.toLocaleString()} $${settings.tokenSymbol}</b> added to your balance!\n` +
@@ -260,15 +284,15 @@ export async function startTelegramBot(): Promise<void> {
 
     bot.command('mine', async (ctx) => {
       if (!ctx.from) return;
-      ensureUser({
+      await ensureUser({
         telegramId: ctx.from.id,
         username: ctx.from.username || null,
         firstName: ctx.from.first_name,
         isPremium: Boolean(ctx.from.is_premium),
       });
-      const settings = getSettings();
+      const settings = await getSettings();
       try {
-        const res = claimMiningStorage(ctx.from.id);
+        const res = await claimMiningStorage(ctx.from.id);
         await ctx.reply(
           `⛏️ <b>Mining Vault Harvested!</b>\n\n` +
             `➕ <b>+${res.claimed.toLocaleString()} $${settings.tokenSymbol}</b> collected!\n` +
@@ -284,12 +308,12 @@ export async function startTelegramBot(): Promise<void> {
 
     bot.command('wallet', async (ctx) => {
       if (!ctx.from) return;
-      ensureUser({
+      await ensureUser({
         telegramId: ctx.from.id,
         username: ctx.from.username || null,
         firstName: ctx.from.first_name,
       });
-      const state = buildUserState(ctx.from.id, 'telegram');
+      const state = await buildUserState(ctx.from.id, 'telegram');
       const kb = new InlineKeyboard();
       const wUrl = getWebAppUrl();
       if (wUrl) {
@@ -314,12 +338,12 @@ export async function startTelegramBot(): Promise<void> {
 
     bot.command('invite', async (ctx) => {
       if (!ctx.from) return;
-      ensureUser({
+      await ensureUser({
         telegramId: ctx.from.id,
         username: ctx.from.username || null,
         firstName: ctx.from.first_name,
       });
-      const { user, settings } = buildUserState(ctx.from.id, 'telegram');
+      const { user, settings } = await buildUserState(ctx.from.id, 'telegram');
       const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(
         user.referralLink
       )}&text=${encodeURIComponent(
@@ -344,13 +368,13 @@ export async function startTelegramBot(): Promise<void> {
 
     bot.command('top', async (ctx) => {
       if (!ctx.from) return;
-      ensureUser({
+      await ensureUser({
         telegramId: ctx.from.id,
         username: ctx.from.username || null,
         firstName: ctx.from.first_name,
       });
-      const state = buildUserState(ctx.from.id, 'telegram');
-      const top = getLeaderboard(10);
+      const state = await buildUserState(ctx.from.id, 'telegram');
+      const top = await getLeaderboard(10);
       const medals = ['🥇', '🥈', '🥉'];
 
       const lines = top.map((entry, idx) => {
@@ -375,8 +399,8 @@ export async function startTelegramBot(): Promise<void> {
         await ctx.reply('⛔️ You do not have admin permissions. Add your Telegram ID to ADMIN_IDS in .env.');
         return;
       }
-      const stats = getAdminStats();
-      const settings = getSettings();
+      const stats = await getAdminStats();
+      const settings = await getSettings();
       const kb = new InlineKeyboard()
         .text('📥 Export Snapshot CSV', 'admin_export_csv')
         .row()
@@ -426,19 +450,19 @@ export async function startTelegramBot(): Promise<void> {
       const data = ctx.callbackQuery.data;
       const uid = ctx.from.id;
 
-      ensureUser({
+      await ensureUser({
         telegramId: uid,
         username: ctx.from.username || null,
         firstName: ctx.from.first_name,
         isPremium: Boolean(ctx.from.is_premium),
       });
 
-      const settings = getSettings();
+      const settings = await getSettings();
 
       if (data === 'menu_home' || data === 'menu_profile') {
         awaitingWalletUsers.delete(uid);
         await ctx.answerCallbackQuery();
-        await ctx.editMessageText(formatDashboardText(uid), {
+        await ctx.editMessageText(await formatDashboardText(uid), {
           parse_mode: 'HTML',
           reply_markup: buildMainMenuKeyboard(),
         }).catch(() => {});
@@ -447,12 +471,12 @@ export async function startTelegramBot(): Promise<void> {
 
       if (data === 'claim_daily') {
         try {
-          const res = claimDailyReward(uid);
+          const res = await claimDailyReward(uid);
           await ctx.answerCallbackQuery({
             text: `🎉 +${res.reward.toLocaleString()} $${settings.tokenSymbol} Claimed! Streak: ${res.newStreak}🔥`,
             show_alert: true,
           });
-          await ctx.editMessageText(formatDashboardText(uid), {
+          await ctx.editMessageText(await formatDashboardText(uid), {
             parse_mode: 'HTML',
             reply_markup: buildMainMenuKeyboard(),
           }).catch(() => {});
@@ -467,12 +491,12 @@ export async function startTelegramBot(): Promise<void> {
 
       if (data === 'claim_mining') {
         try {
-          const res = claimMiningStorage(uid);
+          const res = await claimMiningStorage(uid);
           await ctx.answerCallbackQuery({
             text: `⛏️ Harvested +${res.claimed.toLocaleString()} $${settings.tokenSymbol}!`,
             show_alert: true,
           });
-          await ctx.editMessageText(formatDashboardText(uid), {
+          await ctx.editMessageText(await formatDashboardText(uid), {
             parse_mode: 'HTML',
             reply_markup: buildMainMenuKeyboard(),
           }).catch(() => {});
@@ -487,7 +511,7 @@ export async function startTelegramBot(): Promise<void> {
 
       if (data === 'menu_wallet') {
         await ctx.answerCallbackQuery();
-        const state = buildUserState(uid, 'telegram');
+        const state = await buildUserState(uid, 'telegram');
         const kb = new InlineKeyboard();
         const wUrl = getWebAppUrl();
         if (wUrl) {
@@ -521,7 +545,7 @@ export async function startTelegramBot(): Promise<void> {
 
       if (data === 'menu_invite') {
         await ctx.answerCallbackQuery();
-        const { user } = buildUserState(uid, 'telegram');
+        const { user } = await buildUserState(uid, 'telegram');
         const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(
           user.referralLink
         )}&text=${encodeURIComponent(
@@ -546,8 +570,8 @@ export async function startTelegramBot(): Promise<void> {
 
       if (data === 'menu_leaderboard') {
         await ctx.answerCallbackQuery();
-        const state = buildUserState(uid, 'telegram');
-        const top = getLeaderboard(10);
+        const state = await buildUserState(uid, 'telegram');
+        const top = await getLeaderboard(10);
         const medals = ['🥇', '🥈', '🥉'];
         const lines = top.map(
           (e, i) =>
@@ -573,9 +597,9 @@ export async function startTelegramBot(): Promise<void> {
           return;
         }
         await ctx.answerCallbackQuery({ text: 'Generating CSV snapshot...' });
-        const csv = exportAirdropSnapshotCsv();
+        const csv = await exportAirdropSnapshotCsv();
         const file = new InputFile(
-          Buffer.from(csv, 'utf-8'),
+          new TextEncoder().encode(csv),
           `airdrop_snapshot_${new Date().toISOString().slice(0, 10)}.csv`
         );
         await ctx.replyWithDocument(file, {
@@ -591,7 +615,7 @@ export async function startTelegramBot(): Promise<void> {
           return;
         }
         await ctx.answerCallbackQuery({ text: 'Refreshed!' });
-        const stats = getAdminStats();
+        const stats = await getAdminStats();
         await ctx.editMessageText(
           `🛠️ <b>Admin Control Center — $${settings.tokenSymbol}</b>\n\n` +
             `👥 Total Accounts: <b>${stats.totalUsers.toLocaleString()}</b> (Real TG: ${stats.realUsers.toLocaleString()})\n` +
@@ -623,7 +647,7 @@ export async function startTelegramBot(): Promise<void> {
 
       if (!looksLikeTon) return;
 
-      ensureUser({
+      await ensureUser({
         telegramId: uid,
         username: ctx.from.username || null,
         firstName: ctx.from.first_name,
@@ -639,9 +663,9 @@ export async function startTelegramBot(): Promise<void> {
       }
 
       try {
-        const res = connectUserWallet(uid, text, 'Telegram Bot Direct');
+        const res = await connectUserWallet(uid, text, 'Telegram Bot Direct');
         awaitingWalletUsers.delete(uid);
-        const settings = getSettings();
+        const settings = await getSettings();
         const bonusLine =
           res.bonusAwarded > 0
             ? `\n🎁 <b>+${res.bonusAwarded.toLocaleString()} $${settings.tokenSymbol}</b> first-time wallet bonus credited!`
@@ -659,13 +683,73 @@ export async function startTelegramBot(): Promise<void> {
       console.error('[Bot] Runtime error:', err.message);
     });
 
+    botRunning = true; // handlers are registered and live
+    return bot;
+  } catch (err) {
+    console.error('[Bot] Failed to initialize Telegram Bot:', (err as Error).message);
+    return null;
+  }
+}
+
+/** Node entry (dev server / VPS / Docker / Render): long-polling loop. */
+export async function startTelegramBot(): Promise<void> {
+  const bot = await ensureBot();
+  if (!bot) return;
+  try {
     bot.start({
       onStart: (info) => {
         botRunning = true;
+        pollingActive = true;
         console.log(`[Bot] Telegram Bot @${info.username} is live and polling!`);
       },
     });
   } catch (err) {
-    console.error('[Bot] Failed to initialize Telegram Bot:', (err as Error).message);
+    console.error('[Bot] Failed to start polling:', (err as Error).message);
+  }
+}
+
+/** Cloudflare Workers entry: process a single webhook update. */
+export async function handleWebhookUpdate(update: unknown): Promise<void> {
+  const bot = await ensureBot();
+  if (!bot) return;
+  await bot.handleUpdate(update as Update);
+}
+
+/** Stable per-bot webhook secret derived from the token — no extra config needed. */
+export async function webhookSecret(token: string): Promise<string> {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    'raw',
+    enc.encode(`${token}:webhook`),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, enc.encode('ton-airdrop-webhook'));
+  return [...new Uint8Array(sig)]
+    .slice(0, 24)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+let webhookEnsured = false;
+
+/** Point Telegram's webhook at this deployment (idempotent, checked once per isolate). */
+export async function ensureWebhook(publicOrigin: string): Promise<void> {
+  const token = (env('BOT_TOKEN') || '').trim();
+  if (!token || webhookEnsured) return;
+  try {
+    const bot = await ensureBot();
+    if (!bot) return;
+    const base = (env('WEBAPP_URL') || '').trim().replace(/\/$/, '') || publicOrigin;
+    const wantUrl = `${base}/telegram/webhook`;
+    const info = await bot.api.getWebhookInfo();
+    if (info.url !== wantUrl) {
+      await bot.api.setWebhook(wantUrl, { secret_token: await webhookSecret(token) });
+      console.log(`[Bot] Webhook configured → ${wantUrl}`);
+    }
+    webhookEnsured = true;
+  } catch (err) {
+    console.warn('[Bot] ensureWebhook failed:', (err as Error).message);
   }
 }

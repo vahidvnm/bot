@@ -1,6 +1,5 @@
-import crypto from 'node:crypto';
-import type { Request, Response, NextFunction } from 'express';
 import { ensureUser, isAdminTelegramId } from './db.js';
+import { env } from './config.js';
 
 export interface AuthenticatedTelegramUser {
   telegramId: number;
@@ -20,18 +19,53 @@ export function isDemoAdminId(telegramId: number): boolean {
   return telegramId === DEMO_ADMIN_ID;
 }
 
-declare global {
-  namespace Express {
-    interface Request {
-      tgUser?: AuthenticatedTelegramUser;
-    }
+/** HTTP error carrying a status code — converted to a JSON response by the route dispatcher. */
+export class HttpError extends Error {
+  constructor(
+    public status: number,
+    message: string
+  ) {
+    super(message);
+    this.name = 'HttpError';
   }
 }
 
-export function verifyTelegramInitData(
+async function hmac(key: string | Uint8Array, message: string): Promise<Uint8Array> {
+  const enc = new TextEncoder();
+  const cryptoKey = await crypto.subtle.importKey(
+    'raw',
+    (typeof key === 'string' ? enc.encode(key) : key) as Parameters<
+      typeof crypto.subtle.importKey
+    >[1],
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const sig = await crypto.subtle.sign('HMAC', cryptoKey, enc.encode(message));
+  return new Uint8Array(sig);
+}
+
+function toHex(bytes: Uint8Array): string {
+  let out = '';
+  for (const b of bytes) out += b.toString(16).padStart(2, '0');
+  return out;
+}
+
+function timingSafeEqualHex(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+/**
+ * Validates Telegram Mini App initData (HMAC-SHA256 per official docs).
+ * Uses Web Crypto so the exact same code runs on Node and Cloudflare Workers.
+ */
+export async function verifyTelegramInitData(
   initDataRaw: string,
   botToken: string
-): AuthenticatedTelegramUser | null {
+): Promise<AuthenticatedTelegramUser | null> {
   if (!initDataRaw || !botToken) return null;
 
   try {
@@ -48,19 +82,10 @@ export function verifyTelegramInitData(
     pairs.sort();
     const dataCheckString = pairs.join('\n');
 
-    const secretKey = crypto
-      .createHmac('sha256', 'WebAppData')
-      .update(botToken)
-      .digest();
+    const secretKey = await hmac('WebAppData', botToken);
+    const calculatedHash = toHex(await hmac(secretKey, dataCheckString));
 
-    const calculatedHash = crypto
-      .createHmac('sha256', secretKey)
-      .update(dataCheckString)
-      .digest('hex');
-
-    const a = Buffer.from(calculatedHash, 'hex');
-    const b = Buffer.from(receivedHash, 'hex');
-    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    if (!timingSafeEqualHex(calculatedHash, receivedHash.toLowerCase())) {
       return null;
     }
 
@@ -98,17 +123,22 @@ function parseReferrerIdFromStartParam(startParam: string | null | undefined): n
 }
 
 export function isDemoModeAllowed(): boolean {
-  return process.env.ALLOW_DEMO_MODE !== 'false';
+  return env('ALLOW_DEMO_MODE') !== 'false';
 }
 
-export function requireAuth(req: Request, res: Response, next: NextFunction): void {
-  const initData = (req.headers['x-telegram-init-data'] as string | undefined) || '';
-  const botToken = process.env.BOT_TOKEN || '';
+/**
+ * Resolves the requesting user from headers:
+ * signed Telegram initData → unsigned initData (demo only) → demo headers → 401.
+ * Throws HttpError(401) when nothing matches.
+ */
+export async function requireAuth(req: Request): Promise<AuthenticatedTelegramUser> {
+  const initData = req.headers.get('x-telegram-init-data') || '';
+  const botToken = env('BOT_TOKEN') || '';
 
   if (initData && botToken) {
-    const verified = verifyTelegramInitData(initData, botToken);
+    const verified = await verifyTelegramInitData(initData, botToken);
     if (verified) {
-      ensureUser({
+      await ensureUser({
         telegramId: verified.telegramId,
         username: verified.username,
         firstName: verified.firstName,
@@ -116,9 +146,7 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
         isPremium: verified.isPremium,
         referrerId: parseReferrerIdFromStartParam(verified.startParam),
       });
-      req.tgUser = verified;
-      next();
-      return;
+      return verified;
     }
   }
 
@@ -145,7 +173,7 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
           authMode: 'demo',
           isDemoAdmin: isDemoAdminId(parsed.id),
         };
-        ensureUser({
+        await ensureUser({
           telegramId: u.telegramId,
           username: u.username,
           firstName: u.firstName,
@@ -153,9 +181,7 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
           isPremium: u.isPremium,
           referrerId: parseReferrerIdFromStartParam(u.startParam),
         });
-        req.tgUser = u;
-        next();
-        return;
+        return u;
       }
     } catch {
       // fall through to browser demo user
@@ -163,14 +189,9 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
   }
 
   if (isDemoModeAllowed()) {
-    const customDemoId = parseInt(
-      (req.headers['x-demo-user-id'] as string | undefined) || '777001',
-      10
-    );
+    const customDemoId = parseInt(req.headers.get('x-demo-user-id') || '777001', 10);
     const demoId = !Number.isNaN(customDemoId) && customDemoId > 0 ? customDemoId : 777001;
-    const demoRef = parseReferrerIdFromStartParam(
-      req.headers['x-demo-start-param'] as string | undefined
-    );
+    const demoRef = parseReferrerIdFromStartParam(req.headers.get('x-demo-start-param'));
 
     const demoNames: Record<number, { firstName: string; username: string; premium: boolean }> = {
       777001: { firstName: 'Demo Pioneer', username: 'pioneer_ton', premium: true },
@@ -182,7 +203,7 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
       premium: false,
     };
 
-    ensureUser({
+    await ensureUser({
       telegramId: demoId,
       username: meta.username,
       firstName: meta.firstName,
@@ -191,7 +212,7 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
       referrerId: demoRef,
     });
 
-    req.tgUser = {
+    return {
       telegramId: demoId,
       username: meta.username,
       firstName: meta.firstName,
@@ -201,32 +222,26 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
       authMode: 'demo',
       isDemoAdmin: isDemoAdminId(demoId),
     };
-    next();
-    return;
   }
 
-  res.status(401).json({
-    error: 'Unauthorized. Please launch this Mini App from inside Telegram.',
-  });
+  throw new HttpError(401, 'Unauthorized. Please launch this Mini App from inside Telegram.');
 }
 
-export function requireAdmin(req: Request, res: Response, next: NextFunction): void {
-  const adminHeaderSecret = (req.headers['x-admin-secret'] as string | undefined) || '';
-  const configuredSecret = process.env.ADMIN_SECRET || '';
+/** Throws HttpError(403) unless the user is an admin (ADMIN_IDS, demo admin, or ADMIN_SECRET). */
+export async function requireAdmin(req: Request, user: AuthenticatedTelegramUser): Promise<void> {
+  const adminHeaderSecret = req.headers.get('x-admin-secret') || '';
+  const configuredSecret = env('ADMIN_SECRET') || '';
 
   if (configuredSecret && adminHeaderSecret && adminHeaderSecret === configuredSecret) {
-    next();
     return;
   }
 
-  if (req.tgUser) {
-    if (isAdminTelegramId(req.tgUser.telegramId) || req.tgUser.isDemoAdmin) {
-      next();
-      return;
-    }
+  if (isAdminTelegramId(user.telegramId) || user.isDemoAdmin) {
+    return;
   }
 
-  res.status(403).json({
-    error: 'Admin access required. Set your Telegram ID in ADMIN_IDS or enter ADMIN_SECRET.',
-  });
+  throw new HttpError(
+    403,
+    'Admin access required. Set your Telegram ID in ADMIN_IDS or enter ADMIN_SECRET.'
+  );
 }

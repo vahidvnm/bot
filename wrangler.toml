@@ -1,0 +1,37 @@
+# Cloudflare Workers deployment (FREE tier).
+#
+# One-time setup:
+#   1. npx wrangler login                  (browser OAuth — once)
+#   2. npx wrangler d1 create airdrop       (prints a database_id → paste below)
+#   3. npx wrangler secret put BOT_TOKEN    (from @BotFather)
+#   4. npx wrangler secret put ADMIN_SECRET (any strong string for admin API)
+#   5. npm run deploy:worker
+#
+# Local development (uses a local D1 automatically, no account needed):
+#   npm run dev:worker
+name = "ton-airdrop-miniapp"
+main = "src/server/worker.ts"
+compatibility_date = "2026-11-01"
+
+# Serve the built Mini App (dist/client — run `npm run build` first).
+# API + webhook paths always reach the Worker; everything else is a static asset
+# with SPA fallback for client routes.
+[assets]
+directory = "./dist/client"
+not_found_handling = "single-page-application"
+run_worker_first = ["/api/*", "/telegram/webhook", "/tonconnect-manifest.json"]
+
+# D1 = serverless SQLite (free: ~5M reads + 100k writes per day, 5GB storage).
+# Replace database_id with the value printed by `npx wrangler d1 create airdrop`.
+[[d1_databases]]
+binding = "DB"
+database_name = "airdrop"
+database_id = "00000000-0000-0000-0000-000000000000"
+
+[vars]
+ALLOW_DEMO_MODE = "true" # set to "false" for a real campaign
+BOT_USERNAME = "NovaDropBot"
+TOKEN_NAME = "NovaTON"
+TOKEN_SYMBOL = "NOVA"
+# ADMIN_IDS = "123456789"          # your numeric Telegram ID (or use secrets)
+# WEBAPP_URL = "https://ton-airdrop-miniapp.<account>.workers.dev"  # optional; defaults to the Worker origin
